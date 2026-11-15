@@ -45,17 +45,28 @@
 
 支持两种配置方式：推荐使用下面的**邮箱自动恢复模式**；原有 `COOKIES` 配置继续可用，配置方法在后文。配置 `GLADOS_EMAILS` 后优先使用邮箱模式，旧 `COOKIES` 不会按顺序绑定到邮箱，避免串号。
 
-邮箱模式优先读取每个账号的加密 Cookie 缓存；缺失或明确鉴权失效时才请求邮件验证码。邮箱配置错误或恢复失败不会回退到旧 `COOKIES`。切换到邮箱模式后可删除旧 `COOKIES`；要切回手动模式，删除或清空 `GLADOS_EMAILS` 并配置有效的 `COOKIES`。
+### 认证方式的优先级与切换
+
+| 配置情况 | 实际使用方式 |
+|----------|--------------|
+| `GLADOS_EMAILS` 非空，即使同时配置了 `COOKIES` | 使用邮箱自动恢复模式，忽略 `COOKIES` |
+| 未配置或清空 `GLADOS_EMAILS`，且配置了 `COOKIES` | 使用手动 Cookie 模式 |
+| 两者均未配置 | 报配置缺失错误，无法签到 |
+
+邮箱模式先读取并验证每个账号自己的缓存 Cookie，**有效时直接复用，只有缓存缺失或明确鉴权失败时才发送验证码重新登录**。邮箱配置错误或登录恢复失败时会报错，不会自动退回 `COOKIES`。公共配置有效时，某个账号恢复失败不影响后续账号独立处理。
+
+- **切换到邮箱模式**：配置下文四项必填 Secrets。原 `COOKIES` 可以删除，也可以保留；保留时不会参与邮箱模式，首次没有缓存仍需通过邮件登录。
+- **切换回手动 Cookie 模式**：删除或清空 `GLADOS_EMAILS`，再设置有效的 `COOKIES`。其他 Gmail 配置及加密缓存无需删除，手动模式不会使用它们。Cookie 失效后需要自行重新获取并更新 `COOKIES`。
+
+GitHub Actions 中请在仓库 **Settings → Secrets and variables → Actions** 修改上述配置；本地运行则修改当前终端中的同名环境变量。
 
 ### 新签到验证与 GitHub Actions
 
-官网现在会先获取 `/api/user/checkin/challenge`，在页面中生成 proof，并按要求完成 Cloudflare Turnstile 验证，然后提交签到。脚本通过 Playwright 的标准 Chromium 点击官网签到按钮，让官网代码完成这些步骤，不再直接发送旧的固定 token 请求。
+**正常运行无需手动验证。** Actions 会启动浏览器完成官网的 challenge、proof 和 Cloudflare Turnstile 验证，再提交签到；出现标准的 “Verify you are human” 勾选框时，会自动进行一次正常勾选并等待官方令牌。无需自托管服务器或第三方验证码服务。
 
-如果出现标准的 “Verify you are human” 勾选框，脚本会在确认它位于 Cloudflare 验证域、可访问性角色为 checkbox 后尝试一次正常键盘勾选，再等待官方 API 返回真实令牌。支持验证组件的封闭 Shadow DOM；不会直接填写令牌或处理图片题。`diagnose` 也会检查这一验证交互，但不会点击签到按钮。
+已有用户升级后继续使用原来的配置即可，**不需要新增 Secrets**。邮箱模式仍使用下文四项配置，多账号按邮箱分别保存 Cookie。缓存有效时直接复用；仅缓存缺失、明确失效或设备不匹配时才通过 Gmail 恢复一次登录。浏览器、登录和查询使用相同的 User-Agent，更新后的 Cookie 继续加密缓存。
 
-Actions 会自动安装浏览器系统依赖和离线测试所需的 Chromium，实际签到使用 runner 自带的稳定版 Chrome，在 `xvfb` 虚拟显示器中以有界面模式运行，不需要配置桌面或额外的验证码服务。每个账号使用独立浏览器环境，登录、查询、签到使用相同的浏览器 User-Agent；更新后的 Cookie 仍保存到原有加密缓存。
-
-Actions 使用 `GLADOS_BROWSER_LAUNCH=native`：独立启动自己的 Chrome，再通过仅监听本机的 DevTools 连接控制。使用随机临时 profile，退出时删除，不接管个人浏览器，不修改浏览器验证属性。没有第三方解码服务或伪造令牌。本地默认由 Playwright 启动，也可设置该变量对比原生启动；原生 Chrome / Edge 需能在 PATH 中找到，Chromium 使用 Playwright 安装路径。
+首次升级若旧会话被网站判定为设备不匹配，可能各收到一封新验证码；之后缓存有效就不会重复发码。原有 `COOKIES` 模式也使用新的浏览器签到流程，但失效时仍需自行更新 Cookie。
 
 手动点击 **Actions → GLaDOS Auto Checkin → Run workflow** 时可选择 `mode`：
 
@@ -65,17 +76,21 @@ Actions 使用 `GLADOS_BROWSER_LAUNCH=native`：独立启动自己的 Chrome，�
 | `diagnose` | 只检查已有缓存和官网验证是否自动就绪，不发验证码、不签到、不兑换、不写缓存 |
 | `checkin-no-exchange` | 正常签到并允许必要的邮箱恢复，本次强制关闭积分兑换 |
 
-`runner` 可选择 GitHub 托管的 `ubuntu-latest` 或 `windows-latest`，用于比较验证兼容性；两者均无需自托管机器。Windows 使用原生桌面 Chrome，Ubuntu 使用 xvfb。缓存启用跨系统恢复，仍只缓存 Fernet 密文。定时任务当前默认 Ubuntu；更换默认环境前应先确认新签到成功。
+首次测试推荐选择 `checkin-no-exchange`。`runner` 默认是 GitHub 托管的 `ubuntu-latest`，也可手动选择 `windows-latest`；`account_limit` 默认 `0` 处理全部账号，设为 `1` 可先测试第一个账号，其他账号缓存不会被删除。定时任务每天北京时间 **09:17** 运行，按已有兑换配置执行。
 
-排查时可把 `account_limit` 设为 `1`，先测试列表中的第一个账号；默认 `0` 处理全部账号，未参与本次测试的账号缓存不会删除。本地对应 `--account-limit 1`，可与 `--no-exchange` 或 `--check-challenge` 组合。
+**已验证的运行结果**：GitHub 托管 Ubuntu 上[四账号当天新签到](https://github.com/Ingress007/GLaDOS-Auto-Checkin/actions/runs/43613098333)均成功，获得 11 / 2 / 2 / 2 积分；[随后一轮](https://github.com/Ingress007/GLaDOS-Auto-Checkin/actions/runs/43613615401)及[连续复测第 1 轮](https://github.com/Ingress007/GLaDOS-Auto-Checkin/actions/runs/43659782975)、[第 2 轮](https://github.com/Ingress007/GLaDOS-Auto-Checkin/actions/runs/43659904441)、[第 3 轮](https://github.com/Ingress007/GLaDOS-Auto-Checkin/actions/runs/43660046984)均正常完成验证并返回“已签到”，复用缓存、未发验证码。这些运行均未兑换积分；重复测试不代表再次领取新积分。
 
-Cloudflare 若未能自动完成验证，脚本会明确报错，保留会话并继续处理后续账号；不会因这一错误反复发验证码，也不会在签到失败后兑换积分。浏览器页面只允许本次签到写请求，其他兑换、游戏和登录写操作由浏览器拦截。实际兑换仍仅由 Python 按显式配置执行。
+如果后续再次遇到 Cloudflare 错误，先运行 `diagnose` 查看验证资源状态和错误码。验证失败时会保留会话、继续下一个账号，不会因验证错误反复发验证码，也不会在签到失败后兑换积分。若验证框可见但未完成，诊断会仅截取验证框作为 `verification-widget` artifact，保留 1 天；不上传完整账号页面、Cookie 或邮箱凭据。
 
-`diagnose` 模式会输出验证资源 HTTP 状态和固定格式错误码。若验证框可见但未完成，会仅裁剪验证框上传为 `verification-widget` artifact，保留 1 天；不会截图完整账号页面，也不上传 Cookie、邮箱凭据或加密缓存。
+网站将来若改用图片题或调整验证规则，仍可能需要适配；当前只处理标准勾选框，不处理图片题。Turnstile 令牌短时有效且只能使用一次，不应保存为长期 Secret；在本地手动验证所得的结果也不能直接移交给 GitHub runner。
 
-**自动运行的边界**：标准浏览器能执行官网的验证流程，但 Cloudflare 仍可能要求人工交互，不能保证所有出口 IP 都能无人值守通过。遇到此情况，可先运行 `diagnose` 区分“缓存失效”和“浏览器验证未完成”，再在正常浏览器处理人工验证。不要把 Turnstile 令牌存成长期 Secret；令牌一次有效，且会很快过期。“已签到”的运行结果也不能证明当天新签到验证一定能通过。
+#### 浏览器与本地排查选项
 
-可选 Variable `GLADOS_BROWSER_TIMEOUT` 控制每个浏览器操作等待时间，默认 `120` 秒，可设 `30`–`300` 秒。本地默认使用 Chromium；已安装 Chrome 或 Edge 时可设置环境变量 `GLADOS_BROWSER_CHANNEL=chrome` 或 `msedge`，不需要更改邮箱配置。测试分支没有缓存时可以读取 `main` 的已有密文缓存；保存仍使用当前分支独立的 key。
+Actions 自动安装依赖，实际签到使用 runner 自带的稳定版 Chrome；Ubuntu 通过 `xvfb` 提供显示环境，Windows 使用桌面环境。每个账号使用独立浏览器上下文，临时 profile 退出后删除。官网页面负责生成 nonce、proof 和真实 Turnstile 令牌，脚本不再直接发送旧的固定 token 请求。浏览器只放行本次签到的业务写请求；积分兑换仍由 Python 按显式配置执行。
+
+本地先执行 `python -m playwright install chromium`。默认由 Playwright 启动 Chromium；已安装 Chrome 或 Edge 时可设置 `GLADOS_BROWSER_CHANNEL=chrome` 或 `msedge`。Actions 使用 `GLADOS_BROWSER_LAUNCH=native` 独立启动 Chrome 并通过本机 DevTools 连接；本地也可用该变量对比启动方式，不需要修改邮箱配置。
+
+可选 Variable `GLADOS_BROWSER_TIMEOUT` 控制页面加载、验证和响应等主要等待时间，默认 `120` 秒，可设 `30`–`300` 秒，并非整个账号处理的总时限。本地 `--account-limit 1` 可与 `--no-exchange` 或 `--check-challenge` 组合。缓存只保存 Fernet 密文，支持跨系统恢复；测试分支未命中时可读取 `main` 缓存，保存仍使用当前分支独立的 key。
 
 ### 推荐：统一 Gmail 收件箱，自动恢复多个账号
 
@@ -335,7 +350,9 @@ A: 可以，配置多个 Secrets 即可同时推送。
 
 - 通过官网 Chromium 页面执行新的签到 challenge、proof 和 Turnstile 流程；邮箱恢复、多账号和加密缓存继续保留。
 - 新增只读验证诊断、关闭兑换的单次测试模式和离线浏览器集成测试。
+- 自动完成 Cloudflare 标准验证勾选框，正常运行无需手动验证；已在 GitHub 托管 Ubuntu 验证四账号新签到及连续缓存复用。
 - Cloudflare 失败保留会话，不触发邮件重登；签到失败后跳过积分兑换。
+- 整合上游 challenge 修复（#26 / #27）；由官网浏览器流程统一完成验证，取代 Python 手算 proof 与旧协议回退。
 
 ### v2.2.0
 
@@ -345,6 +362,16 @@ A: 可以，配置多个 Secrets 即可同时推送。
 - 增加离线测试；Actions 启动签到前自动运行测试。
 
 本地验证命令：`python -m unittest discover -s tests -v`。测试使用模拟 HTTP/IMAP，不发验证码、不访问真实账号，也不消耗积分。
+
+### v2.1.2
+
+以下为该版本的历史行为，当前 v2.3.0 已改用上述官网浏览器验证流程，不再回退旧协议。
+
+**问题修复**
+- 修复签到只获得 1 积分的问题（#26）：GLaDOS 官网签到新增了 challenge 验证，脚本直接提交会被服务端判定为自动签到、只发保底 1 分。现在签到前会先请求 `/api/user/checkin/challenge` 取得一次性 nonce，等待约 2.6 秒后以 `sha256(nonce + ".glados-observe-v1")` 计算 proof 并随签到一并提交，与官网前端流程一致
+- challenge 获取失败（网络异常、响应异常、ttl 不足）时自动回退旧协议提交并输出告警日志，不会因此导致签到中断；每次重试都会重新获取新的 nonce
+
+---
 
 ### v2.1.1
 
