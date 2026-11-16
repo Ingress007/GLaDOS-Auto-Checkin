@@ -1,7 +1,8 @@
+import errno
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import requests
 
@@ -17,6 +18,22 @@ def result(index, email, status="repeat", expired=False):
 
 
 class CheckinIntegrationTests(unittest.TestCase):
+    def test_profile_cleanup_failure_still_returns_success_and_pushes_summary(self):
+        driver = checkin.BrowserCheckin()
+        driver.profile = Mock()
+        driver.profile.name = str(Path(tempfile.gettempdir()) / "glados-chrome-fixture")
+        driver.profile.cleanup.side_effect = OSError(errno.ENOTEMPTY, "private profile content")
+        with patch.dict("os.environ", {"COOKIES": "gld:sess=x; gld:sess.sig=y"}, clear=True), \
+                patch.object(checkin, "BrowserCheckin", return_value=driver), \
+                patch.object(type(driver), "__enter__", return_value=driver), \
+                patch.object(checkin, "run_cookie_accounts", return_value=[result(1, "first@gmail.com")]), \
+                patch("browser_checkin.time.sleep"), \
+                patch.object(checkin, "push_all", return_value=(1, 1)) as push, \
+                self.assertLogs("GLaDOS", "WARNING"):
+            self.assertEqual(checkin.main(no_exchange=True), 0)
+        self.assertEqual(push.call_count, 1)
+        self.assertIn("fi***t@gmail.com", push.call_args.args[1])
+
     def test_turnstile_reason_takes_priority_over_auth_like_error_message(self):
         with patch.object(checkin, "checkin_request", return_value={
                 "code": 4, "reason": "turnstile", "message": "Cloudflare Turnstile: invalid token"}), \

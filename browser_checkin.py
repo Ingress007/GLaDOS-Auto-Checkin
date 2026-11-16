@@ -226,27 +226,66 @@ class BrowserCheckin:
             raise BrowserCheckinError("浏览器启动失败：chrome/msedge 需要已安装对应浏览器；chromium 请运行 python -m playwright install --with-deps chromium。有界面模式需要显示器或 xvfb") from None
 
     def __exit__(self, *_):
+        # CDP 连接的 close() 可能只断开连接；先请求自己启动的 Chrome 正常退出，
+        # 让它停止后台写入 profile，再等待进程并清理。收尾错误不能覆盖业务结果。
+        if self.browser and self.process:
+            try:
+                self.browser.new_browser_cdp_session().send("Browser.close")
+            except Exception:
+                # Chrome 退出会关闭 CDP；以下进程等待才是实际退出的判断依据。
+                pass
         try:
             if self.browser:
                 self.browser.close()
-        finally:
+        except Exception as error:
+            logger.warning("浏览器连接关闭失败，不影响已有签到结果 (%s)", type(error).__name__)
+
+        process_stopped = self._stop_native_process()
+        try:
+            if self.runtime:
+                self.runtime.stop()
+        except Exception as error:
+            logger.warning("浏览器控制器关闭失败，不影响已有签到结果 (%s)", type(error).__name__)
+        if self.profile and process_stopped:
+            self._cleanup_profile()
+
+    def _stop_native_process(self):
+        if not self.process or self.process.poll() is not None:
+            return True
+        # 先给正常退出留时间，超时才 terminate / kill；只操作自己创建的进程。
+        for action in (None, self.process.terminate, self.process.kill):
             try:
-                if self.runtime:
-                    self.runtime.stop()
-            finally:
-                if self.process and self.process.poll() is None:
-                    self.process.terminate()
-                    try:
-                        self.process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        self.process.kill()
-                        self.process.wait(timeout=5)
-                if self.profile:
-                    profile_path = Path(self.profile.name).resolve()
-                    if (profile_path.parent != Path(tempfile.gettempdir()).resolve()
-                            or not profile_path.name.startswith("glados-chrome-")):
-                        raise BrowserCheckinError("浏览器临时目录边界检查失败，已跳过清理")
-                    self.profile.cleanup()
+                if action:
+                    action()
+                self.process.wait(timeout=5)
+                return True
+            except subprocess.TimeoutExpired:
+                continue
+            except OSError:
+                if self.process.poll() is not None:
+                    return True
+                break
+        logger.warning("浏览器进程未能确认退出，保留临时目录，不影响已有签到结果")
+        return False
+
+    def _cleanup_profile(self):
+        for attempt in range(3):
+            try:
+                profile = Path(self.profile.name)
+                profile_path = profile.resolve()
+                # 每次递归清理前验证绝对路径，禁止越界或跟随顶层符号链接。
+                if (profile.is_symlink() or profile_path.parent != Path(tempfile.gettempdir()).resolve()
+                        or not profile_path.name.startswith("glados-chrome-")):
+                    logger.warning("浏览器临时目录边界检查失败，已跳过清理")
+                    return
+                self.profile.cleanup()
+                return
+            except OSError as error:
+                if attempt == 2:
+                    logger.warning("浏览器临时目录清理重试后仍失败，不影响已有签到结果 (%s)",
+                                   type(error).__name__)
+                    return
+                time.sleep(0.2 * (attempt + 1))
 
     def _wait_for_verification(self, page):
         deadline = time.monotonic() + min(self.timeout_ms, 30000) / 1000

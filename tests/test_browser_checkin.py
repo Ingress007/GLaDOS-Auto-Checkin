@@ -1,11 +1,15 @@
 """离线测试：本机 fixture 模拟官网，不连接 GLaDOS 或 Cloudflare。"""
+import errno
 import json
 import os
+import subprocess
+import tempfile
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import requests
 
@@ -13,6 +17,88 @@ try:
     import browser_checkin as browser
 except ImportError:
     browser = None
+
+
+class BrowserCleanupTests(unittest.TestCase):
+    def setUp(self):
+        self.driver = browser.BrowserCheckin()
+        self.driver.profile = Mock()
+        self.driver.profile.name = str(Path(tempfile.gettempdir()) / "glados-chrome-fixture")
+
+    def test_temporary_directory_race_is_retried(self):
+        self.driver.profile.cleanup.side_effect = [
+            OSError(errno.ENOTEMPTY, "private profile content"),
+            OSError(errno.EACCES, "private profile content"), None]
+        with patch.object(browser.time, "sleep"):
+            self.driver.__exit__(None, None, None)
+        self.assertEqual(self.driver.profile.cleanup.call_count, 3)
+
+    def test_persistent_cleanup_failure_is_bounded_and_redacted(self):
+        self.driver.profile.cleanup.side_effect = OSError(errno.ENOTEMPTY, "private profile content")
+        with patch.object(browser.time, "sleep"), self.assertLogs("GLaDOS", "WARNING") as logs:
+            self.driver.__exit__(None, None, None)
+        self.assertEqual(self.driver.profile.cleanup.call_count, 3)
+        self.assertNotIn("private profile content", "\n".join(logs.output))
+        self.assertNotIn(self.driver.profile.name, "\n".join(logs.output))
+
+    def test_cleanup_failure_does_not_replace_the_business_exception(self):
+        self.driver.profile.cleanup.side_effect = OSError(errno.ENOTEMPTY, "private profile content")
+        original = ValueError("original business failure")
+        with patch.object(browser.BrowserCheckin, "__enter__", return_value=self.driver), \
+                patch.object(browser.time, "sleep"), self.assertLogs("GLaDOS", "WARNING"), \
+                self.assertRaises(ValueError) as raised:
+            with self.driver:
+                raise original
+        self.assertIs(raised.exception, original)
+
+    def test_native_browser_is_closed_gracefully_before_waiting_for_exit(self):
+        events = []
+        self.driver.browser = Mock()
+        self.driver.process = Mock()
+        self.driver.process.poll.return_value = None
+        self.driver.browser.new_browser_cdp_session.return_value.send.side_effect = events.append
+        self.driver.process.wait.side_effect = lambda **_: events.append("wait")
+        self.driver.__exit__(None, None, None)
+        self.assertEqual(events[:2], ["Browser.close", "wait"])
+        self.driver.process.terminate.assert_not_called()
+        self.driver.process.kill.assert_not_called()
+        self.driver.profile.cleanup.assert_called_once()
+
+    def test_unresponsive_native_browser_is_terminated_then_killed(self):
+        self.driver.browser = Mock()
+        self.driver.process = Mock()
+        self.driver.process.poll.return_value = None
+        timeout = subprocess.TimeoutExpired("fixture chrome", 5)
+        self.driver.process.wait.side_effect = [timeout, timeout, 0]
+        self.driver.__exit__(None, None, None)
+        self.driver.process.terminate.assert_called_once()
+        self.driver.process.kill.assert_called_once()
+        self.driver.profile.cleanup.assert_called_once()
+
+    def test_profile_is_not_deleted_when_browser_cannot_be_stopped(self):
+        self.driver.process = Mock()
+        self.driver.process.poll.return_value = None
+        self.driver.process.wait.side_effect = subprocess.TimeoutExpired("fixture chrome", 5)
+        with self.assertLogs("GLaDOS", "WARNING"):
+            self.driver.__exit__(None, None, None)
+        self.driver.profile.cleanup.assert_not_called()
+
+    def test_close_errors_do_not_prevent_other_resources_from_being_released(self):
+        self.driver.browser = Mock()
+        self.driver.browser.close.side_effect = RuntimeError("private browser content")
+        self.driver.runtime = Mock()
+        self.driver.runtime.stop.side_effect = RuntimeError("private browser content")
+        with self.assertLogs("GLaDOS", "WARNING") as logs:
+            self.driver.__exit__(None, None, None)
+        self.driver.runtime.stop.assert_called_once()
+        self.driver.profile.cleanup.assert_called_once()
+        self.assertNotIn("private browser content", "\n".join(logs.output))
+
+    def test_outside_profile_boundary_is_not_deleted_or_allowed_to_mask_results(self):
+        self.driver.profile.name = str(Path(tempfile.gettempdir()) / "unrelated-directory")
+        with self.assertLogs("GLaDOS", "WARNING"):
+            self.driver.__exit__(None, None, None)
+        self.driver.profile.cleanup.assert_not_called()
 
 
 class BrowserContractTests(unittest.TestCase):
